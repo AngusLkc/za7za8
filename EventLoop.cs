@@ -13,19 +13,6 @@ namespace Project
         error = 0x04
     }
 
-    public interface IEventLoop
-    {
-        /// <summary>
-        /// Socket事件处理方法
-        /// </summary>
-        void EventProcess(Socket sock, IOMode mode);
-
-        /// <summary>
-        /// 定期执行的检查方法
-        /// </summary>
-        void PeriodicHandle();
-    }
-
     internal struct timeval
     {
         public int tv_sec;
@@ -33,62 +20,34 @@ namespace Project
 
         public timeval(long ms)
         {
-            tv_sec = (int)(ms / 1000000L);
-            tv_usec = (int)(ms % 1000000L);
+            tv_sec = (int)(ms / 1000L);
+            tv_usec = (int)(ms % 1000L) * 1000;
         }
     }
 
-    /// <summary>
-    /// 基于上古时期出现的SELECT多路复用技术实现的Socket事件循环库
-    /// 没有C/C++网络编程经验的人不建议使用,否则容易引发类癫痫的症状
-    /// 根据各种评测,在托管的Socket文件描述符不超128个的情况下SELECT最优
-    /// </summary>
     public static class EventLoop
     {
-        /// <summary>
-        /// fileno=>socket
-        /// </summary>
         private static readonly Hashtable RecvList;
-
-        /// <summary>
-        /// fileno=>socket
-        /// </summary>
         private static readonly Hashtable SendList;
-
-        /// <summary>
-        /// fileno=>socket
-        /// </summary>
         private static readonly Hashtable ErrorList;
 
-        /// <summary>
-        /// socket=>event_proc
-        /// </summary>
-        private static readonly Dictionary<Socket, Action<Socket,IOMode>> EventCallback;
+        private static readonly Dictionary<Socket, Action<Socket, IOMode>> EventCallback;
+        private static readonly HashSet<Action> TimerSet;
+        private static int _timeout_interval = 1000;
 
-        private static readonly HashSet<Action> CheckCallback;
-        private static int _timeout_interval = 2000;//毫秒
-        private static int _last_time; //毫秒
-        private static bool _stopped;
+        public static int _last_time;
+        public static bool _stopped;
 
-        /// <summary>
-        /// Socket事件循环监视器,基于系统Select调用
-        /// </summary>
         static EventLoop()
         {
             RecvList = new Hashtable();
             SendList = new Hashtable();
             ErrorList = new Hashtable();
-            EventCallback = new Dictionary<Socket, Action<Socket,IOMode>>();
-            CheckCallback = new HashSet<Action>();
+            EventCallback = new Dictionary<Socket, Action<Socket, IOMode>>();
+            TimerSet = new HashSet<Action>();
         }
 
-        /// <summary>
-        /// 注册所需监视的Socket对象
-        /// </summary>
-        /// <param name="mode">需要监视的事件</param>
-        /// <param name="sock">需要监视的Socket</param>
-        /// <param name="func">监视的Socket发生监视的事件时的回调方法</param>
-        public static void Register(IOMode mode, Socket sock, Action<Socket,IOMode> func)
+        public static void Register(IOMode mode, Socket sock, Action<Socket, IOMode> func)
         {
             if ((mode & IOMode.recv) > 0)
             {
@@ -115,10 +74,6 @@ namespace Project
             }
         }
 
-        /// <summary>
-        /// 注销所需监视的Socket
-        /// </summary>
-        /// <param name="sock">需要注销的Socket</param>
         public static void Unregister(Socket sock)
         {
             if (RecvList.Contains(sock.Handle))
@@ -131,45 +86,29 @@ namespace Project
                 EventCallback.Remove(sock);
         }
 
-        /// <summary>
-        /// 修改需要监视的Socket对应的事件和回调方法
-        /// </summary>
-        /// <param name="mode">需要监视的事件</param>
-        /// <param name="sock">需要监视的Socket</param>
-        /// <param name="func">监视的Socket发生监视的事件时的回调方法</param>
-        public static void Modify(IOMode mode, Socket sock, Action<Socket,IOMode> func)
+        public static void Modify(IOMode mode, Socket sock, Action<Socket, IOMode> func)
         {
             Unregister(sock);
             Register(mode, sock, func);
         }
 
-        /// <summary>
-        /// 添加需要定期执行的方法
-        /// </summary>
-        public static void AddCheckFunc(Action func)
+        public static void AddTimerCB(Action func)
         {
-            if (!CheckCallback.Contains(func))
-                CheckCallback.Add(func);
+            if (!TimerSet.Contains(func))
+                TimerSet.Add(func);
         }
 
-        /// <summary>
-        /// 移除需要定期执行的方法
-        /// </summary>
-        public static void RemoveCheckFunc(Action func)
+        public static void RemoveTimerCB(Action func)
         {
-            if (CheckCallback.Contains(func))
-                CheckCallback.Remove(func);
+            if (TimerSet.Contains(func))
+                TimerSet.Remove(func);
         }
 
-        /// <summary>
-        /// 循环监视已注册的Socket,等待这些Socket发生已注册的事件
-        /// </summary>
-        /// <param name="interval">微秒</param>
         public static void Run(long interval)
         {
             _stopped = false;
             _last_time = Environment.TickCount;
-            timeval tv = new timeval(interval);
+            timeval tv;
             while (true)
             {
                 if (_stopped)
@@ -178,60 +117,69 @@ namespace Project
                     SendList.Clear();
                     ErrorList.Clear();
                     EventCallback.Clear();
-                    CheckCallback.Clear();
+                    TimerSet.Clear();
                     _last_time = Environment.TickCount;
                     return;
+                }
+                if (RecvList.Count == 0 && SendList.Count == 0 && ErrorList.Count == 0 && TimerSet.Count == 0)
+                {
+                    _stopped = true;
+                    continue;
                 }
                 IntPtr[] rlist = SocketSetToIntPtrArray(RecvList);
                 IntPtr[] slist = SocketSetToIntPtrArray(SendList);
                 IntPtr[] elist = SocketSetToIntPtrArray(ErrorList);
-                int res;
+                int res, i;
+                tv = new timeval(interval);
                 if (interval > 0)
                     res = select(0, rlist, slist, elist, ref tv);
                 else
                     res = select(0, rlist, slist, elist, IntPtr.Zero);
-                if (res > 0)
-                {   //rlist、wlist、xlist第一个元素表示文件描述符数量
-                    bool _first = true;
-                    foreach (IntPtr ptr in rlist)
-                    {
-                        if (!_first)
-                            EventCallback[(Socket)RecvList[ptr]]((Socket)RecvList[ptr], IOMode.recv);
-                        else
-                            _first = false;
-                    }
-                    _first = true;
-                    foreach (IntPtr ptr in slist)
-                    {
-                        if (!_first)
-                            EventCallback[(Socket)SendList[ptr]]((Socket)SendList[ptr],IOMode.send);
-                        else
-                            _first = false;
-                    }
-                    _first = true;
-                    foreach (IntPtr ptr in elist)
-                    {
-                        if (!_first)
-                            EventCallback[(Socket)ErrorList[ptr]]((Socket)ErrorList[ptr],IOMode.error);
-                        else
-                            _first = false;
-                    }
-                }
-                else if (res == 0)
-                {
-                    //Logging.Error("SELECT调用超时");
-                }
-                else
-                {
-                    //Logging.Error($"SELECT调用错误:{GetErrorMsg(GetLastError())}");
+                if (_stopped)
                     continue;
-                }
-                //定时触发需要定期执行的方法
-                if (Environment.TickCount - _last_time >= _timeout_interval)
+                lock (OpenTelnet.synclock)
                 {
-                    foreach (Action func in CheckCallback)
-                        func();
-                    _last_time = Environment.TickCount;
+                    if (res > 0)
+                    {   //rlist、wlist、xlist第一个元素表示文件描述符数量
+                        if (rlist != null && (int)rlist[0] > 0)
+                        {
+                            for (i = 1; i <= (int)rlist[0]; i++)
+                            {
+                                EventCallback[(Socket)RecvList[rlist[i]]]((Socket)RecvList[rlist[i]], IOMode.recv);
+                            }
+                        }
+                        if (slist != null && (int)slist[0] > 0)
+                        {
+                            for (i = 1; i <= (int)slist[0]; i++)
+                            {
+                                EventCallback[(Socket)SendList[slist[i]]]((Socket)SendList[slist[i]], IOMode.send);
+                            }
+                        }
+                        if (elist != null && (int)elist[0] > 0)
+                        {
+                            for (i = 1; i <= (int)elist[0]; i++)
+                            {
+                                EventCallback[(Socket)ErrorList[elist[i]]]((Socket)ErrorList[elist[i]], IOMode.error);
+                            }
+                        }
+                    }
+                    else if (res == 0)
+                    {
+                        //Logging.Error("SELECT调用超时");
+                    }
+                    else
+                    {
+                        //Logging.Error($"SELECT调用错误:{GetErrorMsg(GetLastError())}");
+                    }
+                    int current_timestamp = Environment.TickCount;
+                    if (current_timestamp - _last_time >= _timeout_interval)
+                    {
+                        Action[] clone = new Action[TimerSet.Count];
+                        TimerSet.CopyTo(clone);
+                        foreach (Action func in clone)
+                            func();
+                        _last_time = current_timestamp;
+                    }
                 }
             }
         }
@@ -264,20 +212,14 @@ namespace Project
         }
 
         [DllImport("ws2_32.dll", SetLastError = true)]
-        internal static extern int select([In] int ignoredParam, [In] [Out] IntPtr[] readfds, [In] [Out] IntPtr[] writefds, [In] [Out] IntPtr[] exceptfds, [In] ref timeval timeout);
+        internal static extern int select([In] int ignoredParam, [In][Out] IntPtr[] readfds, [In][Out] IntPtr[] writefds, [In][Out] IntPtr[] exceptfds, [In] ref timeval timeout);
 
         [DllImport("ws2_32.dll", SetLastError = true)]
-        internal static extern int select([In] int ignoredParam, [In] [Out] IntPtr[] readfds, [In] [Out] IntPtr[] writefds, [In] [Out] IntPtr[] exceptfds, [In] IntPtr nullTimeout);
+        internal static extern int select([In] int ignoredParam, [In][Out] IntPtr[] readfds, [In][Out] IntPtr[] writefds, [In][Out] IntPtr[] exceptfds, [In] IntPtr nullTimeout);
 
-        /// <summary>
-        /// 获取因调用API产生的错误代码
-        /// </summary>
         [DllImport("kernel32.dll")]
         internal static extern int GetLastError();
 
-        /// <summary>
-        /// 根据错误代码返回错误描述信息
-        /// </summary>
         [DllImport("kernel32.dll")]
         internal static extern int FormatMessage(int flag, IntPtr source, int msgid, int langid, out string buf, int size, IntPtr args);
     }

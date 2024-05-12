@@ -156,4 +156,3 @@ def get_sock_error(sock):
     '''返回socket错误代码和错误描述'''
     error_number = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
     return socket.error(error_number, os.strerror(error_number))
-
