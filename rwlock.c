@@ -15,19 +15,20 @@ void cpu_pause() {
     #endif
 }
 
-//初始化
-void rwlock_init(rwlock_t *lock) {
+//初始化读写锁,如果lock所指内存手动置0可不调此函数
+void rwlock_init(rwlock_t *lock)
+{
     __sync_lock_release(&lock->state);
 }
 
 //申请写锁
-void rwlock_wlock(rwlock_t *lock) {
+void rwlock_wlock(rwlock_t *lock)
+{
     __sync_fetch_and_add(&lock->state, 1ULL << WAIT_SHIFT);
     while (1) {
         uint64_t stval = __sync_fetch_and_add(&lock->state, 0);
         uint32_t wait = (uint32_t)(stval >> WAIT_SHIFT);
-        uint32_t lock = (uint32_t)stval;
-        if (lock == 0) {
+        if ((uint32_t)stval == 0) {
             uint64_t newval = ((uint64_t)(wait - 1) << WAIT_SHIFT) | RWLOCK_WLOCK;
             if (__sync_bool_compare_and_swap(&lock->state, stval, newval))
                 return;
@@ -38,12 +39,12 @@ void rwlock_wlock(rwlock_t *lock) {
 }
 
 //申请读锁
-void rwlock_rlock(rwlock_t *lock) {
+void rwlock_rlock(rwlock_t *lock)
+{
     while (1) {
         uint64_t stval = __sync_fetch_and_add(&lock->state, 0);
         uint32_t wait = (uint32_t)(stval >> WAIT_SHIFT);
-        uint32_t lock = (uint32_t)stval;
-        if (wait != 0 || lock == RWLOCK_WLOCK) {
+        if (wait != 0 || (uint32_t)stval == RWLOCK_WLOCK) {
             cpu_pause();
             continue;
         }
@@ -53,12 +54,12 @@ void rwlock_rlock(rwlock_t *lock) {
     }
 }
 
-//释放锁
-void rwlock_unlock(rwlock_t *lock) {
+//释放读锁或写锁
+void rwlock_unlock(rwlock_t *lock)
+{
     while (1) {
         uint64_t stval = __sync_fetch_and_add(&lock->state, 0);
-        uint32_t lock = (uint32_t)stval;
-        if (lock == RWLOCK_WLOCK) {
+        if ((uint32_t)stval == RWLOCK_WLOCK) {
             uint64_t newval = stval & (0xFFFFFFFFULL << WAIT_SHIFT);
             if (__sync_bool_compare_and_swap(&lock->state, stval, newval))
                 return;
@@ -71,13 +72,13 @@ void rwlock_unlock(rwlock_t *lock) {
 }
 
 //写锁降级为读锁
-void rwlock_degrade(rwlock_t *lock) {
+void rwlock_degrade(rwlock_t *lock)
+{
     while (1) {
         uint64_t stval = __sync_fetch_and_add(&lock->state, 0);
         uint32_t wait = (uint32_t)(stval >> WAIT_SHIFT);
-        uint32_t lock = (uint32_t)stval;
-        if (lock != RWLOCK_WLOCK)
-			return;
+        if ((uint32_t)stval != RWLOCK_WLOCK)
+            return;
         uint64_t newval = ((uint64_t)wait << WAIT_SHIFT) | 1;
         if (__sync_bool_compare_and_swap(&lock->state, stval, newval))
             return;
